@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: pqctunnel-relay
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHONPATH
+        value: /app

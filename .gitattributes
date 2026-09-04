@@ -1,0 +1,23 @@
+# Ensure consistent line endings in the repo regardless of OS
+* text=auto
+
+# Always LF in these files (Docker and shell scripts need LF)
+Dockerfile* text eol=lf
+*.sh        text eol=lf
+*.py        text eol=lf
+*.js        text eol=lf
+*.jsx       text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.toml      text eol=lf
+*.txt       text eol=lf
+*.md        text eol=lf
+*.json      text eol=lf
+
+# Binary files (don't touch line endings)
+*.png       binary
+*.jpg       binary
+*.ico       binary
+*.wasm      binary

@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1: builder
+#   Installs build tools and pip-installs liboqs-python 0.16.0.
+#   liboqs-python auto-downloads, cmake-builds, and installs liboqs 0.16.0
+#   as a shared library on first import. We trigger that here so the final
+#   stage can copy the compiled artifacts without any build tools.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+# Build-time dependencies: git + cmake + C compiler (liboqs needs all three)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        cmake \
+        ninja-build \
+        gcc \
+        g++ \
+        make \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Install the liboqs-python Python wrapper (no compiled .so yet)
+COPY requirements.txt .
+RUN pip install --no-cache-dir liboqs-python==0.16.0
+
+# Trigger the liboqs auto-build: this clones liboqs 0.16.0, runs cmake,
+# compiles, and installs to /root/_oqs/lib/liboqs.so.0.16.0
+RUN python -c "import oqs; print('Builder liboqs version:', oqs.oqs_version())"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2: final
+#   Slim runtime image — no compilers, no cmake.
+#   We copy two things from builder:
+#     1. The Python oqs wrapper (site-packages)
+#     2. The compiled liboqs .so tree (/root/_oqs)
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS final
+
+# liboqs.so links against libssl at runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1. Python wrapper (oqs.py, rand.py, etc.)
+COPY --from=builder /usr/local/lib/python3.12/site-packages \
+                    /usr/local/lib/python3.12/site-packages
+
+# 2. Compiled liboqs shared library tree installed by liboqs-python's auto-build
+#    (lives at /root/_oqs/lib/liboqs.so.0.16.0 in the builder)
+COPY --from=builder /root/_oqs /root/_oqs
+
+# Tell the dynamic linker where to find liboqs.so, and tell oqs.py
+# where the install prefix is so it doesn't try to re-download
+ENV LD_LIBRARY_PATH=/root/_oqs/lib
+ENV OQS_INSTALL_PATH=/root/_oqs
+ENV PYTHONPATH=/app
+
+WORKDIR /app
+
+# Install remaining Python runtime deps (none need compilation)
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+        "cryptography>=43.0.0" \
+        "websockets>=13.0" \
+        "fastapi>=0.115.0" \
+        "uvicorn[standard]>=0.30.0" \
+        "python-dotenv>=1.0.0" \
+        "pytest>=8.0.0" \
+        "pytest-asyncio>=0.23.0"
+
+# Copy application source
+COPY . .
+
+# Smoke-test: will fail loudly here (not at runtime) if the .so copy is broken
+RUN python -c "import oqs; print('Final stage liboqs version:', oqs.oqs_version())"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "network.server:app", "--host", "0.0.0.0", "--port", "8000"]
