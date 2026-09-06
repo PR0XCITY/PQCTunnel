@@ -6,7 +6,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-const RELAY_URL = import.meta.env.VITE_RELAY_URL || 'wss://pqctunnel.onrender.com';
+const RELAY_URL = import.meta.env.VITE_RELAY_URL || (import.meta.env.DEV ? 'ws://localhost:8000' : 'wss://pqctunnel.onrender.com');
 
 export function useWebSocket(roomCode, role, { onMessage, onStatusChange } = {}) {
   const [status, setStatus]   = useState('disconnected'); // disconnected | connecting | connected
@@ -23,6 +23,7 @@ export function useWebSocket(roomCode, role, { onMessage, onStatusChange } = {})
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     const url = `${RELAY_URL}/ws/${roomCode}/${role}`;
+    console.log(`[WS:${role}] connecting to ${url}`);
     setStatus('connecting');
     setError(null);
     onStatusChangeRef.current?.('connecting');
@@ -31,6 +32,7 @@ export function useWebSocket(roomCode, role, { onMessage, onStatusChange } = {})
     wsRef.current = ws;
 
     ws.onopen = () => {
+      console.log(`[WS:${role}] onopen — connection established`);
       setStatus('connected');
       onStatusChangeRef.current?.('connected');
     };
@@ -38,17 +40,20 @@ export function useWebSocket(roomCode, role, { onMessage, onStatusChange } = {})
     ws.onmessage = (evt) => {
       try {
         const msg = JSON.parse(evt.data);
+        console.log(`[WS:${role}] onmessage type=${msg.type}`, msg.payload);
         onMessageRef.current?.(msg);
       } catch {
-        // Ignore non-JSON frames
+        console.warn(`[WS:${role}] non-JSON frame:`, evt.data);
       }
     };
 
-    ws.onerror = () => {
+    ws.onerror = (err) => {
+      console.error(`[WS:${role}] onerror`, err);
       setError('WebSocket connection error');
     };
 
-    ws.onclose = () => {
+    ws.onclose = (evt) => {
+      console.log(`[WS:${role}] onclose code=${evt.code} reason=${evt.reason}`);
       setStatus('disconnected');
       onStatusChangeRef.current?.('disconnected');
     };

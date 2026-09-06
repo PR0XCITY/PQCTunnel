@@ -251,7 +251,8 @@ async def ws_endpoint(websocket: WebSocket, room_code: str, role: str) -> None:
 
     # ── Assign seat ───────────────────────────────────────────────────────────
     setattr(room, role, websocket)
-    logger.info("Room %s: %s joined", room_code, role)
+    occupants = [r for r in ("alice", "bob", "eve") if getattr(room, r) is not None]
+    logger.info("[ROOM %s] %s JOINED — occupants now: %s", room_code, role.upper(), occupants)
 
     # ── Confirm join, notify existing peers ───────────────────────────────────
     existing_peers = [
@@ -265,6 +266,7 @@ async def ws_endpoint(websocket: WebSocket, room_code: str, role: str) -> None:
     for peer_role in existing_peers:
         peer_ws = getattr(room, peer_role)
         if peer_ws:
+            logger.info("[ROOM %s] Sending peer_joined{role=%s} → %s", room_code, role, peer_role.upper())
             await _send(peer_ws, {"type": "peer_joined", "payload": {"role": role}})
 
     # ── Message loop ──────────────────────────────────────────────────────────
