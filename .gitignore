@@ -41,3 +41,6 @@ Thumbs.db
 *.pem
 *.key
 *.crt
+
+# Native dependencies (liboqs is a build-time dep, not tracked)
+liboqs/
