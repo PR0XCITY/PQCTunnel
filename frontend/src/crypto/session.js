@@ -1,45 +1,52 @@
 /**
  * session.js
- * Full hybrid handshake and post-handshake secure session.
+ * Hybrid post-quantum handshake (protocol v2) and post-handshake secure session.
  *
- * Direct JavaScript port of network/session.py.
- * Same handshake flow, same HKDF_INFO, same transcript, same rejection strings.
+ * SessionInitiator  (Alice) — builds ClientHello, processes KemResponse, sends ClientFinished
+ * SessionResponder  (Bob)   — validates ClientHello, builds KemResponse, verifies ClientFinished
+ * SecureSession             — AES-256-GCM with directional keys and replay protection
  *
- * SessionInitiator  (Alice) — builds ClientHello, processes KemResponse
- * SessionResponder  (Bob)   — validates ClientHello, builds KemResponse
- * SecureSession             — post-handshake AES-GCM with replay protection
+ * Every handshake step and every encrypt/decrypt is recorded as a trace of
+ * { label, detail, value?, secret?, ok, ms } entries so the UI can show the
+ * real bytes at each stage. Traces are display-only; nothing reads them back.
  *
- * Replay detection order for SecureSession.decrypt():
- *   GCM verification runs FIRST, replay check SECOND.
- *   Rationale: tamper attacks use a fresh seq so GCM fails before replay check;
- *   replay attacks reuse the original ciphertext so GCM passes but replay fires.
- *   This gives each attack its correct distinct rejection string.
- *   (Differs from Python reference which checks replay first — intentional for demo.)
+ * Decrypt order: seq validation → GCM verification → replay check.
+ *   Tamper (fresh seq, corrupted ct)  → DecryptionError "GCM auth tag mismatch"
+ *   Replay (original frame)           → ReplayError "sequence number N already used"
+ *   Reflection (own frame sent back)  → DecryptionError (wrong directional key)
  */
 
 import { generateX25519Keypair, x25519Exchange, hkdfDerive } from './classical.js';
 import {
   kemGenerateKeypair, kemEncapsulate, kemDecapsulate,
   signGenerateKeypair, signMessage, verifySignature,
-  SignatureVerificationError,
 } from './pqc.js';
-import { encrypt, decrypt, DecryptionError } from './symmetric.js';
+import { encrypt, decrypt } from './symmetric.js';
 import {
   HKDF_INFO,
+  SIG_LABEL_INITIATOR,
+  SIG_LABEL_RESPONDER,
   computeTranscript,
+  deriveSafetyCode,
+  signedPayload,
   validateClientHello,
+  validateKemResponse,
+  validateClientFinished,
   buildClientHello,
   buildKemResponse,
+  buildClientFinished,
   buildDataMessage,
   parseDataMessage,
   seqAad,
-  bytesToB64,
   b64ToBytes,
+  toHex,
   ProtocolError,
   ReplayError,
 } from './protocol.js';
 
-// ── Timing record ──────────────────────────────────────────────────────────
+const now = () => performance.now();
+
+// ── Timing + trace record ──────────────────────────────────────────────────
 
 export class HandshakeTiming {
   constructor() {
@@ -64,91 +71,132 @@ export class HandshakeTiming {
   }
 }
 
+/** Runs one handshake step, timing it and appending a trace entry. */
+class StepLog {
+  constructor(timing) { this.timing = timing; this.steps = []; }
+
+  async run(label, timingField, fn, describe = () => ({})) {
+    const t = now();
+    try {
+      const result = await fn();
+      const ms = now() - t;
+      if (timingField) this.timing[timingField] += ms;
+      this.steps.push({ label, ms, ok: true, ...describe(result) });
+      return result;
+    } catch (e) {
+      this.steps.push({ label, ms: now() - t, ok: false, detail: e.message });
+      throw e;
+    }
+  }
+}
+
+async function deriveDirectionalKeys(xSs, kemSs, transcript) {
+  const okm = await hkdfDerive(xSs, kemSs, HKDF_INFO, 64, transcript);
+  return { aliceToBob: okm.slice(0, 32), bobToAlice: okm.slice(32, 64) };
+}
+
+const short = (bytes, n = 24) => {
+  const h = toHex(bytes);
+  return h.length > n * 2 ? `${h.slice(0, n * 2)}…` : h;
+};
+
 // ── SessionInitiator (Alice) ───────────────────────────────────────────────
 
 export class SessionInitiator {
-  /**
-   * Constructs Alice's session state and generates all keypairs.
-   * Call await init() after construction.
-   */
   constructor() {
     this.timing   = new HandshakeTiming();
+    this.log      = new StepLog(this.timing);
     this._session = null;
-    // Will be set by init()
-    this._xPriv   = null;
-    this.xPub     = null;
-    this.kemPk    = null;
-    this._kemSk   = null;
-    this.sigPk    = null;
-    this._sigSk   = null;
+    this.safetyCode = null;
   }
 
-  /** Async initializer — must be awaited before using other methods. */
+  /** Generate all keypairs. Must be awaited before using other methods. */
   async init() {
-    const t0 = performance.now();
-    const { privateKey: xPriv, publicKey: xPub } = await generateX25519Keypair();
-    const { publicKey: kemPk, secretKey: kemSk }  = kemGenerateKeypair();
-    const { publicKey: sigPk, secretKey: sigSk }  = signGenerateKeypair();
-    this.timing.keygenMs = performance.now() - t0;
+    const t0 = now();
+    const x = await this.log.run('Generate X25519 keypair', 'keygenMs',
+      () => generateX25519Keypair(),
+      r => ({ detail: 'Classical ECDH key (32 B public)', value: toHex(r.publicKey) }));
+    const kem = await this.log.run('Generate ML-KEM-768 keypair', 'keygenMs',
+      () => kemGenerateKeypair(),
+      r => ({ detail: `FIPS 203 KEM — pk ${r.publicKey.length} B, sk ${r.secretKey.length} B`, value: short(r.publicKey) }));
+    const sig = await this.log.run('Generate ML-DSA-65 keypair', 'keygenMs',
+      () => signGenerateKeypair(),
+      r => ({ detail: `FIPS 204 signature key — pk ${r.publicKey.length} B`, value: short(r.publicKey) }));
+    this._initMs = now() - t0;
 
-    this._xPriv = xPriv;
-    this.xPub   = xPub;
-    this.kemPk  = kemPk;
-    this._kemSk = kemSk;
-    this.sigPk  = sigPk;
-    this._sigSk = sigSk;
+    this._xPriv = x.privateKey;
+    this.xPub   = x.publicKey;
+    this.kemPk  = kem.publicKey;
+    this._kemSk = kem.secretKey;
+    this.sigPk  = sig.publicKey;
+    this._sigSk = sig.secretKey;
     return this;
   }
 
   /** Build the ClientHello payload to send to the relay. */
   buildClientHello() {
+    this.log.steps.push({ label: 'Send ClientHello →', ok: true, ms: 0, wire: true,
+      detail: 'x25519_pk + kem_pk + sig_pk (public keys only)' });
     return buildClientHello('alice', this.xPub, this.kemPk, this.sigPk);
   }
 
   /**
-   * Process Bob's KemResponse. Derives session key and verifies his signature.
-   * @param {object} responsePayload  KemResponse payload dict from relay
-   * @returns {SecureSession}
-   * @throws {SignatureVerificationError} if Bob's transcript signature is invalid
+   * Process Bob's KemResponse: verify his signature, derive keys, sign the
+   * transcript ourselves.
+   * @returns {Promise<object>} ClientFinished payload to send to Bob
+   * @throws {ProtocolError|SignatureVerificationError}
    */
   async processKemResponse(responsePayload) {
-    const t0 = performance.now();
+    const t0 = now();
+    const L = this.log;
+    L.steps.push({ label: '← Receive KemResponse', ok: true, ms: 0, wire: true,
+      detail: 'kem_ct + x25519_pk + sig_pk + signature' });
 
-    const peerXPub = b64ToBytes(responsePayload.x25519_pk);
-    const kemCt    = b64ToBytes(responsePayload.kem_ct);
+    await L.run('Validate KemResponse fields', null,
+      () => validateKemResponse(responsePayload),
+      () => ({ detail: 'All field sizes correct (no downgrade)' }));
+
+    const peerXPub  = b64ToBytes(responsePayload.x25519_pk);
+    const kemCt     = b64ToBytes(responsePayload.kem_ct);
     const peerSigPk = b64ToBytes(responsePayload.sig_pk);
     const signature = b64ToBytes(responsePayload.signature);
 
-    // X25519 exchange
-    const tx = performance.now();
-    const xSs = await x25519Exchange(this._xPriv, peerXPub);
-    this.timing.x25519Ms = performance.now() - tx;
+    const xSs = await L.run('X25519 Diffie-Hellman', 'x25519Ms',
+      () => x25519Exchange(this._xPriv, peerXPub),
+      r => ({ detail: 'Classical shared secret (32 B)', value: toHex(r), secret: true }));
 
-    // ML-KEM decapsulate
-    const tk = performance.now();
-    const kemSs = kemDecapsulate(this._kemSk, kemCt);
-    this.timing.kemMs = performance.now() - tk;
+    const kemSs = await L.run('ML-KEM-768 decapsulate', 'kemMs',
+      () => kemDecapsulate(this._kemSk, kemCt),
+      r => ({ detail: `Recovered PQ shared secret from ${kemCt.length} B ciphertext`, value: toHex(r), secret: true }));
 
-    // HKDF hybrid derivation
-    const th = performance.now();
-    const sessionKey = await hkdfDerive(xSs, kemSs, HKDF_INFO);
-    this.timing.hkdfMs = performance.now() - th;
+    const transcript = await L.run('Transcript hash (SHA-256)', null,
+      () => computeTranscript(this.xPub, this.kemPk, this.sigPk, peerXPub, peerSigPk, kemCt),
+      r => ({ detail: 'Hash of every public value exchanged', value: toHex(r) }));
 
-    // Compute transcript (using keys WE sent and keys Bob sent)
-    const transcript = await computeTranscript(
-      this.xPub, this.kemPk, this.sigPk,
-      peerXPub, peerSigPk,
-      kemCt,
-    );
+    await L.run("Verify Bob's ML-DSA-65 signature", 'verifyMs',
+      () => verifySignature(peerSigPk, signedPayload(SIG_LABEL_RESPONDER, transcript), signature),
+      () => ({ detail: `${signature.length} B signature valid over transcript` }));
 
-    // Verify Bob's ML-DSA-65 signature over the transcript
-    const tv = performance.now();
-    verifySignature(peerSigPk, transcript, signature);  // throws on failure
-    this.timing.verifyMs = performance.now() - tv;
+    const keys = await L.run('HKDF-SHA-256 → directional keys', 'hkdfMs',
+      () => deriveDirectionalKeys(xSs, kemSs, transcript),
+      r => ({ detail: 'IKM = x25519_ss ‖ kem_ss, salt = transcript', value: `A→B ${toHex(r.aliceToBob)}\nB→A ${toHex(r.bobToAlice)}`, secret: true }));
 
-    this.timing.totalMs = performance.now() - t0;
-    this._session = new SecureSession(sessionKey, 'alice');
-    return this._session;
+    const mySig = await L.run('Sign transcript (ML-DSA-65)', 'signMs',
+      () => signMessage(this._sigSk, signedPayload(SIG_LABEL_INITIATOR, transcript)),
+      r => ({ detail: `Proves Alice holds her advertised key (${r.length} B)` }));
+
+    this.safetyCode = await L.run('Derive safety code', null,
+      () => deriveSafetyCode(transcript),
+      r => ({ detail: 'Compare with peer out-of-band to rule out MITM', value: `${r.emoji.join(' ')}  ${r.digits}` }));
+
+    L.steps.push({ label: 'Send ClientFinished →', ok: true, ms: 0, wire: true,
+      detail: "Alice's transcript signature" });
+
+    this.transcript = transcript;
+    this.timing.keygenMs = this._initMs;
+    this.timing.totalMs = this._initMs + (now() - t0);
+    this._session = new SecureSession(keys.aliceToBob, keys.bobToAlice, 'alice');
+    return buildClientFinished(mySig);
   }
 
   get session() {
@@ -162,75 +210,108 @@ export class SessionInitiator {
 export class SessionResponder {
   constructor() {
     this.timing   = new HandshakeTiming();
+    this.log      = new StepLog(this.timing);
     this._session = null;
-    this._xPriv   = null;
-    this.xPub     = null;
-    this.sigPk    = null;
-    this._sigSk   = null;
+    this._pending = null;
+    this.safetyCode = null;
   }
 
-  /** Async initializer — must be awaited. */
+  /** Generate keypairs. Must be awaited. */
   async init() {
-    const t0 = performance.now();
-    const { privateKey: xPriv, publicKey: xPub } = await generateX25519Keypair();
-    const { publicKey: sigPk, secretKey: sigSk }  = signGenerateKeypair();
-    this.timing.keygenMs = performance.now() - t0;
+    const t0 = now();
+    const x = await this.log.run('Generate X25519 keypair', 'keygenMs',
+      () => generateX25519Keypair(),
+      r => ({ detail: 'Classical ECDH key (32 B public)', value: toHex(r.publicKey) }));
+    const sig = await this.log.run('Generate ML-DSA-65 keypair', 'keygenMs',
+      () => signGenerateKeypair(),
+      r => ({ detail: `FIPS 204 signature key — pk ${r.publicKey.length} B`, value: short(r.publicKey) }));
+    this._initMs = now() - t0;
 
-    this._xPriv = xPriv;
-    this.xPub   = xPub;
-    this.sigPk  = sigPk;
-    this._sigSk = sigSk;
+    this._xPriv = x.privateKey;
+    this.xPub   = x.publicKey;
+    this.sigPk  = sig.publicKey;
+    this._sigSk = sig.secretKey;
     return this;
   }
 
   /**
-   * Process Alice's ClientHello. Encapsulates, derives session key, signs transcript.
-   * @param {object} helloPayload       ClientHello payload dict
-   * @param {object|null} originalHello Original ClientHello for MITM pre-check
-   * @returns {object} KemResponse payload dict to send back
-   * @throws {ProtocolError} on downgrade or key substitution
+   * Process Alice's ClientHello: encapsulate, derive keys, sign the transcript.
+   * The session is not usable until processClientFinished() succeeds.
+   * @returns {Promise<object>} KemResponse payload to send back
+   * @throws {ProtocolError} on downgrade / malformed hello
    */
-  async processClientHello(helloPayload, originalHello = null) {
-    const t0 = performance.now();
+  async processClientHello(helloPayload) {
+    const t0 = now();
+    const L = this.log;
+    L.steps.push({ label: '← Receive ClientHello', ok: true, ms: 0, wire: true,
+      detail: "Alice's x25519_pk + kem_pk + sig_pk" });
 
-    // Pre-crypto validation (catches downgrade and MITM)
-    validateClientHello(helloPayload, originalHello);
+    await L.run('Validate ClientHello fields', null,
+      () => validateClientHello(helloPayload),
+      () => ({ detail: 'Version 2, PQC keys present and correctly sized' }));
 
-    const peerXPub = b64ToBytes(helloPayload.x25519_pk);
-    const kemPk    = b64ToBytes(helloPayload.kem_pk);
+    const peerXPub  = b64ToBytes(helloPayload.x25519_pk);
+    const kemPk     = b64ToBytes(helloPayload.kem_pk);
     const peerSigPk = b64ToBytes(helloPayload.sig_pk);
 
-    // X25519 exchange
-    const tx = performance.now();
-    const xSs = await x25519Exchange(this._xPriv, peerXPub);
-    this.timing.x25519Ms = performance.now() - tx;
+    const xSs = await L.run('X25519 Diffie-Hellman', 'x25519Ms',
+      () => x25519Exchange(this._xPriv, peerXPub),
+      r => ({ detail: 'Classical shared secret (32 B)', value: toHex(r), secret: true }));
 
-    // ML-KEM encapsulate to Alice's public key
-    const tk = performance.now();
-    const { cipherText: kemCt, sharedSecret: kemSs } = kemEncapsulate(kemPk);
-    this.timing.kemMs = performance.now() - tk;
+    const { cipherText: kemCt, sharedSecret: kemSs } = await L.run('ML-KEM-768 encapsulate', 'kemMs',
+      () => kemEncapsulate(kemPk),
+      r => ({ detail: `PQ shared secret + ${r.cipherText.length} B ciphertext for Alice`, value: toHex(r.sharedSecret), secret: true }));
 
-    // HKDF hybrid derivation
-    const th = performance.now();
-    const sessionKey = await hkdfDerive(xSs, kemSs, HKDF_INFO);
-    this.timing.hkdfMs = performance.now() - th;
+    const transcript = await L.run('Transcript hash (SHA-256)', null,
+      () => computeTranscript(peerXPub, kemPk, peerSigPk, this.xPub, this.sigPk, kemCt),
+      r => ({ detail: 'Hash of every public value exchanged', value: toHex(r) }));
 
-    // Compute transcript
-    const transcript = await computeTranscript(
-      peerXPub, kemPk, peerSigPk,
-      this.xPub, this.sigPk,
-      kemCt,
-    );
+    const keys = await L.run('HKDF-SHA-256 → directional keys', 'hkdfMs',
+      () => deriveDirectionalKeys(xSs, kemSs, transcript),
+      r => ({ detail: 'IKM = x25519_ss ‖ kem_ss, salt = transcript', value: `A→B ${toHex(r.aliceToBob)}\nB→A ${toHex(r.bobToAlice)}`, secret: true }));
 
-    // Sign transcript with our ML-DSA-65 key
-    const ts = performance.now();
-    const signature = signMessage(this._sigSk, transcript);
-    this.timing.signMs = performance.now() - ts;
+    const signature = await L.run('Sign transcript (ML-DSA-65)', 'signMs',
+      () => signMessage(this._sigSk, signedPayload(SIG_LABEL_RESPONDER, transcript)),
+      r => ({ detail: `Proves Bob holds his advertised key (${r.length} B)` }));
 
-    this.timing.totalMs = performance.now() - t0;
-    this._session = new SecureSession(sessionKey, 'bob');
+    this.safetyCode = await L.run('Derive safety code', null,
+      () => deriveSafetyCode(transcript),
+      r => ({ detail: 'Compare with peer out-of-band to rule out MITM', value: `${r.emoji.join(' ')}  ${r.digits}` }));
 
+    L.steps.push({ label: 'Send KemResponse →', ok: true, ms: 0, wire: true,
+      detail: 'kem_ct + x25519_pk + sig_pk + signature' });
+
+    this.transcript = transcript;
+    this._pending = { keys, peerSigPk, transcript };
+    this._t = this._initMs + (now() - t0);
     return buildKemResponse(kemCt, this.xPub, this.sigPk, signature);
+  }
+
+  /**
+   * Verify Alice's transcript signature and activate the session.
+   * @throws {ProtocolError|SignatureVerificationError}
+   */
+  async processClientFinished(finishedPayload) {
+    if (!this._pending) throw new ProtocolError('unexpected ClientFinished');
+    const t0 = now();
+    const L = this.log;
+    L.steps.push({ label: '← Receive ClientFinished', ok: true, ms: 0, wire: true,
+      detail: "Alice's transcript signature" });
+
+    await L.run('Validate ClientFinished', null,
+      () => validateClientFinished(finishedPayload));
+    const signature = b64ToBytes(finishedPayload.signature);
+    const { keys, peerSigPk, transcript } = this._pending;
+
+    await L.run("Verify Alice's ML-DSA-65 signature", 'verifyMs',
+      () => verifySignature(peerSigPk, signedPayload(SIG_LABEL_INITIATOR, transcript), signature),
+      () => ({ detail: `${signature.length} B signature valid over transcript` }));
+
+    this.timing.keygenMs = this._initMs;
+    this.timing.totalMs = this._t + (now() - t0);
+    this._pending = null;
+    this._session = new SecureSession(keys.bobToAlice, keys.aliceToBob, 'bob');
+    return this._session;
   }
 
   get session() {
@@ -243,61 +324,115 @@ export class SessionResponder {
 
 export class SecureSession {
   /**
-   * @param {Uint8Array} sessionKey  32-byte session key
-   * @param {string}     role        'alice' or 'bob'
+   * @param {Uint8Array} sendKey  32-byte key for messages we send
+   * @param {Uint8Array} recvKey  32-byte key for messages we receive
+   * @param {string}     role     'alice' or 'bob'
    */
-  constructor(sessionKey, role) {
-    if (sessionKey.length !== 32) throw new Error('Session key must be 32 bytes');
-    this._key      = sessionKey;
+  constructor(sendKey, recvKey, role) {
+    if (sendKey.length !== 32 || recvKey.length !== 32) throw new Error('Session keys must be 32 bytes');
+    this._sendKey  = sendKey;
+    this._recvKey  = recvKey;
     this._role     = role;
     this._sendSeq  = 0;
     this._recvSeen = new Set();
   }
 
   /**
-   * Encrypt a plaintext message and return a DataMessage payload.
+   * Encrypt and return the wire payload plus a step-by-step trace.
    * @param {Uint8Array|string} plaintext
-   * @returns {Promise<object>} DataMessage payload ready to send
+   * @returns {Promise<{ payload: object, trace: object[] }>}
    */
-  async encryptMessage(plaintext) {
-    const pt  = typeof plaintext === 'string'
-      ? new TextEncoder().encode(plaintext)
-      : plaintext;
+  async seal(plaintext) {
+    const trace = [];
+    const pt = typeof plaintext === 'string' ? new TextEncoder().encode(plaintext) : plaintext;
+    trace.push({ label: 'Plaintext → UTF-8 bytes', ok: true, ms: 0,
+      detail: `${pt.length} bytes`, value: toHex(pt) });
+
     const seq = this._sendSeq++;
     const aad = seqAad(seq);
-    const { nonce, ciphertext, tag } = await encrypt(this._key, pt, aad);
-    return buildDataMessage(seq, nonce, ciphertext, tag);
+    trace.push({ label: 'Sequence number → AAD', ok: true, ms: 0,
+      detail: `seq ${seq} as 8-byte big-endian (authenticated, not encrypted)`, value: toHex(aad) });
+    trace.push({ label: `Select ${this._role === 'alice' ? 'Alice→Bob' : 'Bob→Alice'} key`, ok: true, ms: 0,
+      detail: 'AES-256 key from HKDF (direction-specific)', value: toHex(this._sendKey), secret: true });
+
+    const t = now();
+    const { nonce, ciphertext, tag } = await encrypt(this._sendKey, pt, aad);
+    const ms = now() - t;
+    trace.push({ label: 'Random 96-bit nonce', ok: true, ms: 0,
+      detail: 'crypto.getRandomValues — never reused', value: toHex(nonce) });
+    trace.push({ label: 'AES-256-GCM encrypt', ok: true, ms,
+      detail: `${ciphertext.length} B ciphertext`, value: toHex(ciphertext) });
+    trace.push({ label: 'GCM authentication tag', ok: true, ms: 0,
+      detail: '128-bit tag over nonce + AAD + ciphertext', value: toHex(tag) });
+
+    const payload = buildDataMessage(seq, nonce, ciphertext, tag);
+    trace.push({ label: 'Base64 wire frame', ok: true, ms: 0,
+      detail: 'What the relay (and Eve) actually see', value: JSON.stringify(payload, null, 1) });
+    return { payload, trace };
   }
 
   /**
-   * Decrypt a DataMessage payload.
-   *
-   * Ordering: GCM verification runs BEFORE replay check.
-   * This ensures:
-   *   - Tamper attack (corrupted ciphertext, fresh seq) → DecryptionError "GCM auth tag mismatch"
-   *   - Replay attack (original frame, same seq)        → ReplayError "sequence number N already used"
-   *
-   * @param {object} payload  DataMessage payload from relay
-   * @returns {Promise<Uint8Array>} Decrypted plaintext bytes
-   * @throws {DecryptionError} "GCM auth tag mismatch"
-   * @throws {ReplayError}     "sequence number N already used"
+   * Validate, authenticate and decrypt a DataMessage, returning a trace.
+   * Errors thrown carry `.trace` showing where processing stopped.
+   * @returns {Promise<{ plaintext: Uint8Array, trace: object[] }>}
    */
-  async decryptMessage(payload) {
-    const { seq, nonce, ciphertext, tag } = parseDataMessage(payload);
+  async open(payload) {
+    const trace = [];
+    const fail = (e) => {
+      trace.push({ label: 'REJECTED', ok: false, ms: 0, detail: e.message });
+      e.trace = trace;
+      return e;
+    };
+
+    trace.push({ label: 'Receive wire frame', ok: true, ms: 0,
+      detail: 'Base64 JSON from relay', value: JSON.stringify(payload, null, 1) });
+
+    let parsed;
+    try {
+      parsed = parseDataMessage(payload);
+    } catch (e) { throw fail(e); }
+    const { seq, nonce, ciphertext, tag } = parsed;
     const aad = seqAad(seq);
+    trace.push({ label: 'Validate frame + rebuild AAD', ok: true, ms: 0,
+      detail: `seq ${seq} is a valid integer; nonce 12 B, tag 16 B`, value: toHex(aad) });
+    trace.push({ label: `Select ${this._role === 'alice' ? 'Bob→Alice' : 'Alice→Bob'} key`, ok: true, ms: 0,
+      detail: 'AES-256 key from HKDF (direction-specific)', value: toHex(this._recvKey), secret: true });
 
-    // GCM first — tamper attacks are caught here even if seq was unseen
-    const plaintext = await decrypt(this._key, nonce, ciphertext, tag, aad);
+    const t = now();
+    let plaintext;
+    try {
+      plaintext = await decrypt(this._recvKey, nonce, ciphertext, tag, aad);
+    } catch (e) {
+      trace.push({ label: 'AES-256-GCM verify tag', ok: false, ms: now() - t,
+        detail: 'Tag does not match — frame was modified or encrypted under another key', value: toHex(tag) });
+      throw fail(e);
+    }
+    trace.push({ label: 'AES-256-GCM verify tag', ok: true, ms: now() - t,
+      detail: 'Tag valid — ciphertext, nonce and seq are authentic', value: toHex(tag) });
 
-    // Replay check after successful decryption
     if (this._recvSeen.has(seq)) {
-      throw new ReplayError(`sequence number ${seq} already used`);
+      trace.push({ label: 'Replay check', ok: false, ms: 0, detail: `seq ${seq} was already accepted` });
+      throw fail(new ReplayError(`sequence number ${seq} already used`));
     }
     this._recvSeen.add(seq);
-
-    return plaintext;
+    trace.push({ label: 'Replay check', ok: true, ms: 0, detail: `seq ${seq} is new` });
+    trace.push({ label: 'Decrypted bytes → UTF-8', ok: true, ms: 0,
+      detail: `${plaintext.length} bytes`, value: toHex(plaintext) });
+    return { plaintext, trace };
   }
 
+  /** Encrypt and return only the DataMessage payload. */
+  async encryptMessage(plaintext) {
+    return (await this.seal(plaintext)).payload;
+  }
+
+  /** Decrypt and return only the plaintext bytes. */
+  async decryptMessage(payload) {
+    return (await this.open(payload)).plaintext;
+  }
+
+  get sendKey()     { return this._sendKey; }
+  get recvKey()     { return this._recvKey; }
   get nextSendSeq() { return this._sendSeq; }
   get seenSeqs()    { return new Set(this._recvSeen); }
 }

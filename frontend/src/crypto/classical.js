@@ -45,16 +45,18 @@ export async function x25519Exchange(privateKey, peerPubBytes) {
  * HKDF-SHA-256 hybrid key derivation.
  *
  * IKM  = x25519SharedSecret || kemSharedSecret
- * Salt = 32 zero bytes (RFC 5869 default when salt is not provided; matches PyCA)
+ * Salt = caller-supplied (v2 passes the transcript hash); defaults to 32 zero
+ *        bytes, the RFC 5869 / PyCA default used by the v1 Python reference
  * Info = UTF-8 encoded info string
  *
  * @param {Uint8Array} x25519Ss  32-byte X25519 shared secret
  * @param {Uint8Array} kemSs     32-byte ML-KEM shared secret
  * @param {Uint8Array|string} info  HKDF context string or bytes
  * @param {number} length  Output length in bytes (default 32)
+ * @param {Uint8Array} [salt]  HKDF salt
  * @returns {Promise<Uint8Array>} Derived key bytes
  */
-export async function hkdfDerive(x25519Ss, kemSs, info, length = 32) {
+export async function hkdfDerive(x25519Ss, kemSs, info, length = 32, salt = new Uint8Array(32)) {
   // Concatenate IKM exactly as Python does: x25519_ss + kem_ss
   const ikm = new Uint8Array(x25519Ss.length + kemSs.length);
   ikm.set(x25519Ss, 0);
@@ -63,9 +65,6 @@ export async function hkdfDerive(x25519Ss, kemSs, info, length = 32) {
   const infoBytes = typeof info === 'string'
     ? new TextEncoder().encode(info)
     : info;
-
-  // PyCA uses 32 zero-bytes as salt when salt=None (SHA-256 digest size = 32)
-  const salt = new Uint8Array(32);
 
   const ikmKey = await subtle().importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
   const derived = await subtle().deriveBits(

@@ -2,14 +2,17 @@
  * mitm.js — Key substitution (MITM) attack frame builder.
  *
  * Replaces the initiator's x25519_pk and kem_pk with Eve's own keys while
- * keeping the original sig_pk (a common MITM pattern — the attacker keeps
- * the victim's identity key to avoid the transcript signature check).
+ * keeping the original sig_pk, then injects the hello at Bob.
  *
- * Two possible rejection paths depending on relay state:
- *   - If relay has the original ClientHello stored:
- *       "public key does not match session identity"  (relay pre-check)
- *   - If not (relay bypassed or first hello):
- *       "ML-DSA signature verification failed: transcript hash mismatch"  (client JS)
+ * Expected outcomes:
+ *   - Relay pre-check (unless Eve bypasses it):
+ *       "public key does not match session identity"
+ *   - Bob already has a session: "unexpected ClientHello: session already established"
+ *   - Otherwise Bob answers, and Alice's check of Bob's signature fails because
+ *     her transcript differs: "ML-DSA signature verification failed: transcript hash mismatch"
+ *
+ * A *successful* MITM needs Eve to control the relay (MITM mode in Eve's
+ * console) and run two full handshakes — which the safety codes expose.
  */
 
 import { bytesToB64 } from '../crypto/protocol.js';

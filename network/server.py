@@ -27,8 +27,9 @@ Pre-checks the relay CAN perform without crypto (all on cleartext fields)
 
 1. REPLAY pre-check
    DataMessage seq numbers travel in cleartext as GCM AAD. The relay tracks
-   seen seqs per sender. A repeated seq is rejected before delivery.
-   Rejection: "sequence number N already used"
+   seen seqs per sender. A repeated seq is rejected before delivery, and a seq
+   that is not a non-negative integer is rejected outright.
+   Rejections: "sequence number N already used", "invalid sequence number: X"
 
 2. DOWNGRADE pre-check
    ClientHello PQC field sizes are visible as base64 lengths. An empty or
@@ -36,14 +37,21 @@ Pre-checks the relay CAN perform without crypto (all on cleartext fields)
    Rejection: "malformed ClientHello: PQC fields missing"
 
 3. MITM pre-check
-   The relay stores the first ClientHello seen per role. A later injected
-   ClientHello whose public-key base64 strings differ → key substitution.
+   The relay stores the first ClientHello from Alice and the first KemResponse
+   from Bob. An injected handshake frame whose public keys differ from the
+   stored ones for the peer it impersonates → key substitution.
    Rejection: "public key does not match session identity"
 
-These are belt-and-suspenders checks. The client JS does the same checks
-(and additionally verifies ML-DSA signatures) — so even if the relay is
-bypassed, the crypto still holds. The relay's checks just short-circuit
-obviously invalid frames before they consume client-side crypto budget.
+These are belt-and-suspenders checks. The client JS does its own validation
+and signature checks, and the safety code exposes a MITM even when the relay
+itself is malicious. To demonstrate that, Eve has two demo switches that model
+a compromised relay:
+
+  * inject {..., "bypass_relay_checks": true} — skip the pre-checks above, so
+    the frame reaches the client and its crypto has to catch it.
+  * {"type": "set_mitm", "payload": {"enabled": true}} — the relay stops
+    forwarding Alice↔Bob frames and hands them only to Eve, who can then run
+    a handshake with each side.
 
 ────────────────────────────────────────────────────────────────────────────
 Room model
@@ -51,24 +59,29 @@ Room model
 
 One room per room code. Exactly one Alice, one Bob, one Eve per room.
 Duplicate role claims are rejected (WebSocket close code 4000).
-All room state is in-memory — no persistence, no DB.
+All room state is in-memory — no persistence, no DB. Handshake and replay
+state resets when Alice or Bob leaves, so a reconnecting peer starts clean.
 
 ────────────────────────────────────────────────────────────────────────────
 Message envelope format (all JSON)
 ────────────────────────────────────────────────────────────────────────────
 
 Client → relay:
-  {"type": "client_hello",  "payload": {version, role, x25519_pk, kem_pk, sig_pk}}
-  {"type": "kem_response",  "payload": {kem_ct, x25519_pk, sig_pk, signature}}
-  {"type": "data",          "payload": {seq, nonce, ciphertext, tag}}
-  {"type": "inject",        "payload": {target: "alice"|"bob", frame: <any envelope>}}  (Eve only)
+  {"type": "client_hello",    "payload": {version, role, x25519_pk, kem_pk, sig_pk}}
+  {"type": "kem_response",    "payload": {kem_ct, x25519_pk, sig_pk, signature}}
+  {"type": "client_finished", "payload": {signature}}
+  {"type": "data",            "payload": {seq, nonce, ciphertext, tag}}
+  {"type": "alert",           "payload": {reason, frame_type}}   (receiver rejected a frame)
+  {"type": "inject",          "payload": {target, frame, bypass_relay_checks?}}  (Eve only)
+  {"type": "set_mitm",        "payload": {enabled}}                              (Eve only)
 
 Relay → client:
   {"type": "joined",        "payload": {role, room, peers}}
   {"type": "peer_joined",   "payload": {role}}
   {"type": "peer_left",     "payload": {role}}
-  {"type": "mirror",        "payload": {from, frame, ts}}                              (Eve only)
-  {"type": "inject_ok",     "payload": {target, frame_type}}                           (Eve only)
+  {"type": "mirror",        "payload": {from, frame, ts, held}}                 (Eve only)
+  {"type": "inject_ok",     "payload": {target, frame_type, bypassed}}          (Eve only)
+  {"type": "mitm_status",   "payload": {enabled}}                               (Eve only)
   {"type": "rejection",     "payload": {reason}}
   {"type": "error",         "payload": {reason}}
 
@@ -78,8 +91,8 @@ GET /health → {"status": "ok"}
 from __future__ import annotations
 
 import base64
-import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -89,7 +102,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PQCTunnel Relay", version="1.0.0")
+app = FastAPI(title="PQCTunnel Relay", version="2.0.0")
 
 # Allow all origins for the Vercel frontend
 app.add_middleware(
@@ -104,7 +117,11 @@ app.add_middleware(
 _ML_KEM_768_PK_BYTES = 1184
 _ML_DSA_65_PK_BYTES  = 1952
 
+_MAX_SEQ = 2**53 - 1   # largest seq the browser can represent exactly
+
 VALID_ROLES = frozenset({"alice", "bob", "eve"})
+PEER_MESSAGE_TYPES = frozenset({"client_hello", "kem_response", "client_finished", "data", "alert"})
+_ROOM_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
 # ── Room model ────────────────────────────────────────────────────────────────
@@ -116,16 +133,25 @@ class Room:
     bob:   Optional[WebSocket]    = None
     eve:   Optional[WebSocket]    = None
 
-    # First ClientHello seen per role — stored as raw payload dict (cleartext
-    # public keys in base64) for the MITM byte-equality pre-check only.
-    # The relay does not interpret, decode, or use these keys cryptographically.
-    alice_original_hello: Optional[dict] = None
-    bob_original_hello:   Optional[dict] = None
+    # First handshake frame seen from each side — stored as raw payload dicts
+    # (cleartext public keys in base64) for the MITM byte-equality pre-check
+    # only. The relay does not interpret, decode, or use these keys.
+    alice_original_hello:    Optional[dict] = None
+    bob_original_response:   Optional[dict] = None
 
     # Seq numbers seen FROM each role (cleartext field in DataMessage payload).
     # Used for replay pre-rejection: does not require decryption.
     alice_seen_seqs: set = field(default_factory=set)
     bob_seen_seqs:   set = field(default_factory=set)
+
+    # Demo: compromised-relay MITM mode — Alice/Bob frames go only to Eve.
+    mitm: bool = False
+
+    def reset_session_state(self) -> None:
+        self.alice_original_hello = None
+        self.bob_original_response = None
+        self.alice_seen_seqs.clear()
+        self.bob_seen_seqs.clear()
 
 
 # ── In-memory room registry ───────────────────────────────────────────────────
@@ -163,6 +189,10 @@ def _error(reason: str) -> dict:
     return {"type": "error", "payload": {"reason": reason}}
 
 
+def _other(role: str) -> str:
+    return "bob" if role == "alice" else "alice"
+
+
 # ── Seq helpers ───────────────────────────────────────────────────────────────
 
 def _seen_seqs_for_sender(room: Room, sender_role: str) -> set:
@@ -170,20 +200,39 @@ def _seen_seqs_for_sender(room: Room, sender_role: str) -> set:
     return room.alice_seen_seqs if sender_role == "alice" else room.bob_seen_seqs
 
 
-def _seen_seqs_for_inject_target(room: Room, target_role: str) -> set:
+def _parse_seq(payload) -> Optional[int]:
     """
-    When Eve injects to target_role, the frame appears to come FROM the
-    opposite peer. Return that peer's seen-seq set.
+    Return the DataMessage seq if it is a JSON integer in [0, 2^53), else None.
+    Strings, floats and booleans are refused: the browser would otherwise map
+    some of them onto the AAD of an earlier seq.
     """
-    return room.alice_seen_seqs if target_role == "bob" else room.bob_seen_seqs
+    if not isinstance(payload, dict):
+        return None
+    seq = payload.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or not 0 <= seq <= _MAX_SEQ:
+        return None
+    return seq
+
+
+def _check_seq(room: Room, sender_role: str, payload) -> tuple[Optional[str], Optional[int]]:
+    """Return (rejection reason, seq). Does not record the seq."""
+    seq = _parse_seq(payload)
+    if seq is None:
+        raw = payload.get("seq") if isinstance(payload, dict) else None
+        return f"invalid sequence number: {raw!r}", None
+    if seq in _seen_seqs_for_sender(room, sender_role):
+        return f"sequence number {seq} already used", seq
+    return None, seq
 
 
 # ── Cleartext pre-checks (no crypto) ─────────────────────────────────────────
 
-def _base64_decoded_len(b64: str) -> int:
-    """Return the byte length of a base64-encoded field without full decoding."""
+def _base64_decoded_len(b64) -> int:
+    """Return the byte length of a base64-encoded field, 0 if invalid."""
+    if not isinstance(b64, str):
+        return 0
     try:
-        return len(base64.b64decode(b64))
+        return len(base64.b64decode(b64, validate=True))
     except Exception:
         return 0
 
@@ -202,15 +251,41 @@ def _check_client_hello_pqc(payload: dict) -> Optional[str]:
     return None
 
 
-def _check_key_substitution(payload: dict, original: dict) -> Optional[str]:
+def _check_key_substitution(payload: dict, original: dict, fields: tuple[str, ...]) -> Optional[str]:
     """
     Compare public-key base64 strings byte-for-byte.
     Returns rejection reason if keys differ, None if they match.
     This is plain string equality — no crypto.
     """
-    fields = ("x25519_pk", "kem_pk", "sig_pk")
     if any(payload.get(f) != original.get(f) for f in fields):
         return "public key does not match session identity"
+    return None
+
+
+def _precheck_inject(room: Room, target_role: str, frame_type, frame_payload) -> Optional[str]:
+    """
+    Pre-checks for a frame Eve injects at target_role. The frame impersonates
+    the target's peer, so it is compared against what that peer really sent —
+    never against anything the frame says about itself.
+    """
+    impersonated = _other(target_role)
+
+    if frame_type == "client_hello":
+        reason = _check_client_hello_pqc(frame_payload)
+        if reason:
+            return reason
+        if room.alice_original_hello is not None:
+            return _check_key_substitution(
+                frame_payload, room.alice_original_hello, ("x25519_pk", "kem_pk", "sig_pk"))
+
+    if frame_type == "kem_response" and room.bob_original_response is not None:
+        return _check_key_substitution(
+            frame_payload, room.bob_original_response, ("x25519_pk", "sig_pk", "kem_ct"))
+
+    if frame_type == "data":
+        reason, _ = _check_seq(room, impersonated, frame_payload)
+        return reason
+
     return None
 
 
@@ -230,11 +305,14 @@ async def health() -> dict:
 
 @app.websocket("/ws/{room_code}/{role}")
 async def ws_endpoint(websocket: WebSocket, room_code: str, role: str) -> None:
-    # ── Validate role before accepting ───────────────────────────────────────
+    # ── Validate role and room before accepting ──────────────────────────────
     if role not in VALID_ROLES:
         await websocket.close(
             code=4000, reason=f"invalid role: {role!r}; must be alice, bob, or eve"
         )
+        return
+    if not _ROOM_CODE_RE.match(room_code):
+        await websocket.close(code=4000, reason="invalid room code")
         return
 
     await websocket.accept()
@@ -263,10 +341,11 @@ async def ws_endpoint(websocket: WebSocket, room_code: str, role: str) -> None:
         "type": "joined",
         "payload": {"role": role, "room": room_code, "peers": existing_peers},
     })
+    if role == "eve":
+        await _send(websocket, {"type": "mitm_status", "payload": {"enabled": room.mitm}})
     for peer_role in existing_peers:
         peer_ws = getattr(room, peer_role)
         if peer_ws:
-            logger.info("[ROOM %s] Sending peer_joined{role=%s} → %s", room_code, role, peer_role.upper())
             await _send(peer_ws, {"type": "peer_joined", "payload": {"role": role}})
 
     # ── Message loop ──────────────────────────────────────────────────────────
@@ -276,6 +355,9 @@ async def ws_endpoint(websocket: WebSocket, room_code: str, role: str) -> None:
                 envelope = await websocket.receive_json()
             except Exception:
                 break   # parse error or disconnect
+            if not isinstance(envelope, dict):
+                await _send(websocket, _error("envelope must be a JSON object"))
+                continue
 
             if role == "eve":
                 await _handle_eve(room, websocket, envelope)
@@ -288,6 +370,11 @@ async def ws_endpoint(websocket: WebSocket, room_code: str, role: str) -> None:
         logger.exception("Unexpected error for %s in room %s: %s", role, room_code, exc)
     finally:
         setattr(room, role, None)
+        if role in ("alice", "bob"):
+            # The session is gone; a reconnecting peer starts at seq 0 again.
+            room.reset_session_state()
+        else:
+            room.mitm = False
         logger.info("Room %s: %s left", room_code, role)
         # Notify remaining connected peers
         for other_role in VALID_ROLES - {role}:
@@ -306,37 +393,32 @@ async def _handle_peer(
     envelope: dict,
 ) -> None:
     msg_type = envelope.get("type")
-    payload  = envelope.get("payload", {})
-    peer_role = "bob" if sender_role == "alice" else "alice"
-    peer_ws   = getattr(room, peer_role)
+    payload  = envelope.get("payload")
+    peer_ws  = getattr(room, _other(sender_role))
 
-    # ── Store the first ClientHello for MITM pre-check ────────────────────────
-    if msg_type == "client_hello":
-        hello_key = f"{sender_role}_original_hello"
-        if getattr(room, hello_key) is None:
-            setattr(room, hello_key, payload)
-            logger.debug("Room %s: stored %s original ClientHello", room.code, sender_role)
+    if msg_type not in PEER_MESSAGE_TYPES:
+        await _send(sender_ws, _error(f"unknown message type: {msg_type!r}"))
+        return
+
+    # ── Store the first handshake frame from each side for MITM pre-check ────
+    if isinstance(payload, dict):
+        if msg_type == "client_hello" and sender_role == "alice" and room.alice_original_hello is None:
+            room.alice_original_hello = payload
+        if msg_type == "kem_response" and sender_role == "bob" and room.bob_original_response is None:
+            room.bob_original_response = payload
 
     # ── Relay-side replay pre-check for DataMessages ──────────────────────────
     if msg_type == "data":
-        try:
-            seq = int(payload["seq"])
-        except (KeyError, TypeError, ValueError):
-            seq = -1
+        reason, seq = _check_seq(room, sender_role, payload)
+        if reason:
+            await _send(sender_ws, _rejection(reason))
+            if room.eve:
+                await _send(room.eve, _rejection(reason))
+            return
+        _seen_seqs_for_sender(room, sender_role).add(seq)
 
-        if seq >= 0:
-            seen = _seen_seqs_for_sender(room, sender_role)
-            if seq in seen:
-                reason = f"sequence number {seq} already used"
-                await _send(sender_ws, _rejection(reason))
-                # Also alert Eve so she sees the same rejection
-                if room.eve:
-                    await _send(room.eve, _rejection(reason))
-                return
-            seen.add(seq)
-
-    # ── Forward to peer ───────────────────────────────────────────────────────
-    if peer_ws:
+    # ── Forward to peer (unless a compromised relay hands it to Eve) ──────────
+    if peer_ws and not room.mitm:
         await _send(peer_ws, envelope)
 
     # ── Mirror every frame to Eve ─────────────────────────────────────────────
@@ -347,6 +429,7 @@ async def _handle_peer(
                 "from":  sender_role,
                 "frame": envelope,
                 "ts":    time.time(),
+                "held":  room.mitm,
             },
         })
 
@@ -359,18 +442,33 @@ async def _handle_eve(
     envelope: dict,
 ) -> None:
     msg_type = envelope.get("type")
-    payload  = envelope.get("payload", {})
+    payload  = envelope.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if msg_type == "set_mitm":
+        room.mitm = bool(payload.get("enabled"))
+        logger.info("Room %s: MITM mode %s", room.code, "ON" if room.mitm else "OFF")
+        await _send(eve_ws, {"type": "mitm_status", "payload": {"enabled": room.mitm}})
+        return
 
     if msg_type != "inject":
         await _send(eve_ws, _rejection(
-            f"Eve may only send 'inject' messages; got {msg_type!r}"
+            f"Eve may only send 'inject' or 'set_mitm' messages; got {msg_type!r}"
         ))
         return
 
-    target_role  = payload.get("target")
-    frame        = payload.get("frame", {})
-    frame_type   = frame.get("type")
-    frame_payload = frame.get("payload", {})
+    target_role = payload.get("target")
+    frame       = payload.get("frame")
+    bypass      = bool(payload.get("bypass_relay_checks"))
+
+    if not isinstance(frame, dict):
+        await _send(eve_ws, _rejection("inject frame must be a JSON object"))
+        return
+    frame_type    = frame.get("type")
+    frame_payload = frame.get("payload")
+    if not isinstance(frame_payload, dict):
+        frame_payload = {}
 
     # ── Validate target ───────────────────────────────────────────────────────
     if target_role not in ("alice", "bob"):
@@ -384,44 +482,20 @@ async def _handle_eve(
         await _send(eve_ws, _rejection(f"{target_role} is not connected"))
         return
 
-    # ── ClientHello pre-checks (downgrade + MITM) ─────────────────────────────
-    if frame_type == "client_hello":
-        # 1. Downgrade check — are PQC fields present and correctly sized?
-        reason = _check_client_hello_pqc(frame_payload)
+    # ── Cleartext pre-checks (downgrade, MITM, replay) ────────────────────────
+    if not bypass:
+        reason = _precheck_inject(room, target_role, frame_type, frame_payload)
         if reason:
             await _send(eve_ws, _rejection(reason))
             return
-
-        # 2. MITM check — do the public keys match the original ClientHello?
-        sender_of_hello = frame_payload.get("role")
-        original_key    = f"{sender_of_hello}_original_hello"
-        original_hello  = getattr(room, original_key, None)
-        if original_hello is not None:
-            reason = _check_key_substitution(frame_payload, original_hello)
-            if reason:
-                await _send(eve_ws, _rejection(reason))
-                return
-
-    # ── DataMessage replay pre-check ──────────────────────────────────────────
-    if frame_type == "data":
-        try:
-            seq = int(frame_payload["seq"])
-        except (KeyError, TypeError, ValueError):
-            seq = -1
-
-        if seq >= 0:
-            seen = _seen_seqs_for_inject_target(room, target_role)
-            if seq in seen:
-                reason = f"sequence number {seq} already used"
-                await _send(eve_ws, _rejection(reason))
-                return
 
     # ── Deliver injected frame to target ──────────────────────────────────────
     await _send(target_ws, frame)
     await _send(eve_ws, {
         "type": "inject_ok",
-        "payload": {"target": target_role, "frame_type": frame_type},
+        "payload": {"target": target_role, "frame_type": frame_type, "bypassed": bypass},
     })
     logger.info(
-        "Room %s: Eve injected %r to %s", room.code, frame_type, target_role
+        "Room %s: Eve injected %r to %s%s", room.code, frame_type, target_role,
+        " (relay checks bypassed)" if bypass else "",
     )

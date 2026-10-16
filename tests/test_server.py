@@ -510,3 +510,175 @@ class TestHealth:
     def test_health_content_type_json(self, live_server):
         resp = httpx.get(BASE_HTTP + "/health", timeout=5)
         assert "application/json" in resp.headers.get("content-type", "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Protocol v2 hardening + demo switches
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def drain(*sockets, timeout: float = 0.3) -> None:
+    """Read and discard everything currently queued on each socket."""
+    for ws in sockets:
+        while True:
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=timeout)
+            except asyncio.TimeoutError:
+                break
+
+
+async def recv_type(ws, msg_type: str, timeout: float = 2.0) -> dict:
+    """Read until a message of msg_type arrives."""
+    deadline = time.monotonic() + timeout
+    while True:
+        msg = await recv(ws, timeout=max(0.05, deadline - time.monotonic()))
+        if msg["type"] == msg_type:
+            return msg
+
+
+class TestHardening:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_seq", ["0", "x", 0.5, None, -1, True, 2**53])
+    async def test_peer_invalid_seq_rejected(self, live_server, bad_seq):
+        """Non-integer seqs are refused instead of slipping past the replay set."""
+        room = fresh_room()
+        async with connect(live_server, room, "alice") as ws_a, \
+                   connect(live_server, room, "bob")   as ws_b:
+            await drain(ws_a, ws_b)
+            msg = _data_msg(0)
+            msg["payload"]["seq"] = bad_seq
+            await send(ws_a, msg)
+            rej = await recv(ws_a)
+            assert rej["type"] == "rejection"
+            assert "invalid sequence number" in rej["payload"]["reason"]
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(ws_b.recv(), timeout=0.3)
+
+    @pytest.mark.asyncio
+    async def test_inject_string_seq_replay_rejected(self, live_server):
+        """The v1 bypass (seq as a string) is caught by the relay pre-check."""
+        room = fresh_room()
+        async with connect(live_server, room, "alice") as ws_a, \
+                   connect(live_server, room, "bob")   as ws_b, \
+                   connect(live_server, room, "eve")   as ws_e:
+            await drain(ws_a, ws_b, ws_e)
+            bad = _data_msg(0)
+            bad["payload"]["seq"] = "x"
+            await send(ws_e, {"type": "inject", "payload": {"target": "bob", "frame": bad}})
+            rej = await recv_type(ws_e, "rejection")
+            assert "invalid sequence number" in rej["payload"]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_mitm_check_ignores_frame_role(self, live_server):
+        """Relabelling the injected hello's role no longer skips the MITM check."""
+        room = fresh_room()
+        async with connect(live_server, room, "alice") as ws_a, \
+                   connect(live_server, room, "bob")   as ws_b, \
+                   connect(live_server, room, "eve")   as ws_e:
+            await drain(ws_a, ws_b, ws_e)
+            await send(ws_a, _client_hello("alice"))
+            await drain(ws_b, ws_e)
+
+            evil = _client_hello("eve")
+            evil["payload"]["x25519_pk"] = _EVE_X25519_PK
+            evil["payload"]["kem_pk"] = _EVE_KEM_PK
+            await send(ws_e, {"type": "inject", "payload": {"target": "bob", "frame": evil}})
+            rej = await recv_type(ws_e, "rejection")
+            assert rej["payload"]["reason"] == "public key does not match session identity"
+
+    @pytest.mark.asyncio
+    async def test_kem_response_substitution_rejected(self, live_server):
+        """An injected KemResponse with different keys than Bob's is refused."""
+        room = fresh_room()
+        async with connect(live_server, room, "alice") as ws_a, \
+                   connect(live_server, room, "bob")   as ws_b, \
+                   connect(live_server, room, "eve")   as ws_e:
+            await drain(ws_a, ws_b, ws_e)
+            real = {"type": "kem_response", "payload": {
+                "kem_ct": _b64(b"\x01" * 1088), "x25519_pk": _DUMMY_X25519_PK,
+                "sig_pk": _DUMMY_SIG_PK, "signature": _b64(b"\x02" * 3309)}}
+            await send(ws_b, real)
+            await drain(ws_a, ws_e)
+            fake = {"type": "kem_response", "payload": {**real["payload"], "x25519_pk": _EVE_X25519_PK}}
+            await send(ws_e, {"type": "inject", "payload": {"target": "alice", "frame": fake}})
+            rej = await recv_type(ws_e, "rejection")
+            assert rej["payload"]["reason"] == "public key does not match session identity"
+
+    @pytest.mark.asyncio
+    async def test_state_resets_when_peer_reconnects(self, live_server):
+        """After Alice leaves and returns, her seq 0 is accepted again."""
+        room = fresh_room()
+        async with connect(live_server, room, "bob") as ws_b:
+            async with connect(live_server, room, "alice") as ws_a:
+                await drain(ws_a, ws_b)
+                await send(ws_a, _data_msg(0))
+                assert (await recv(ws_b))["type"] == "data"
+            await drain(ws_b)  # peer_left
+            async with connect(live_server, room, "alice") as ws_a2:
+                await drain(ws_a2, ws_b)
+                await send(ws_a2, _data_msg(0))
+                assert (await recv(ws_b))["type"] == "data"
+
+    @pytest.mark.asyncio
+    async def test_unknown_peer_message_type_refused(self, live_server):
+        room = fresh_room()
+        async with connect(live_server, room, "alice") as ws_a:
+            await drain(ws_a)
+            await send(ws_a, {"type": "launch_missiles", "payload": {}})
+            err = await recv(ws_a)
+            assert err["type"] == "error"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_room", ["a" * 33, "room%20one"])
+    async def test_invalid_room_code_rejected(self, live_server, bad_room):
+        with pytest.raises(Exception):
+            async with websockets.connect(f"{live_server}/ws/{bad_room}/alice") as ws:
+                await asyncio.wait_for(ws.recv(), timeout=2.0)
+
+
+class TestDemoSwitches:
+    @pytest.mark.asyncio
+    async def test_bypass_delivers_replay_to_client(self, live_server):
+        """With relay checks bypassed, a replayed frame reaches the client."""
+        room = fresh_room()
+        async with connect(live_server, room, "alice") as ws_a, \
+                   connect(live_server, room, "bob")   as ws_b, \
+                   connect(live_server, room, "eve")   as ws_e:
+            await drain(ws_a, ws_b, ws_e)
+            await send(ws_a, _data_msg(0))
+            await drain(ws_b, ws_e)
+            await send(ws_e, {"type": "inject", "payload": {
+                "target": "bob", "frame": _data_msg(0), "bypass_relay_checks": True}})
+            ok = await recv_type(ws_e, "inject_ok")
+            assert ok["payload"]["bypassed"] is True
+            assert (await recv(ws_b))["payload"]["seq"] == 0
+
+    @pytest.mark.asyncio
+    async def test_mitm_mode_holds_frames_for_eve(self, live_server):
+        """In MITM mode Bob gets nothing directly; Eve gets the held frame."""
+        room = fresh_room()
+        async with connect(live_server, room, "alice") as ws_a, \
+                   connect(live_server, room, "bob")   as ws_b, \
+                   connect(live_server, room, "eve")   as ws_e:
+            await drain(ws_a, ws_b, ws_e)
+            await send(ws_e, {"type": "set_mitm", "payload": {"enabled": True}})
+            status = await recv_type(ws_e, "mitm_status")
+            assert status["payload"]["enabled"] is True
+
+            await send(ws_a, _client_hello("alice"))
+            mirror = await recv_type(ws_e, "mirror")
+            assert mirror["payload"]["held"] is True
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(ws_b.recv(), timeout=0.3)
+
+    @pytest.mark.asyncio
+    async def test_mitm_mode_off_when_eve_leaves(self, live_server):
+        room = fresh_room()
+        async with connect(live_server, room, "alice") as ws_a, \
+                   connect(live_server, room, "bob")   as ws_b:
+            async with connect(live_server, room, "eve") as ws_e:
+                await drain(ws_e)
+                await send(ws_e, {"type": "set_mitm", "payload": {"enabled": True}})
+                await recv_type(ws_e, "mitm_status")
+            await drain(ws_a, ws_b)
+            await send(ws_a, _data_msg(0))
+            assert (await recv(ws_b))["type"] == "data"

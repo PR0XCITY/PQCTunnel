@@ -2,21 +2,25 @@
  * protocol.js
  * Wire-format message definitions for the PQCTunnel handshake and data channel.
  *
- * Direct JavaScript port of network/protocol.py.
- * Same field names, same base64 encoding, same constants, same rejection vocabulary.
+ * Protocol v2 (browser). The Python package in network/ is the v1 reference.
  *
- * Constants
- * ---------
- * PROTOCOL_VERSION       "1"
- * HKDF_INFO              "pqctunnel-session-v1"   (UTF-8 bytes when used in HKDF)
- * TRANSCRIPT_DOMAIN_SEP  "pqctunnel-handshake-v1\x00" (UTF-8 bytes)
+ * Handshake (3 messages)
+ * ----------------------
+ *   Alice → Bob   ClientHello     { version, role, x25519_pk, kem_pk, sig_pk }
+ *   Bob   → Alice KemResponse     { kem_ct, x25519_pk, sig_pk, signature }
+ *   Alice → Bob   ClientFinished  { signature }
  *
- * Field sizes (decoded bytes)
- * ---------------------------
- * X25519_PK_SIZE       32
- * ML_KEM_768_PK_SIZE   1184
- * ML_KEM_768_CT_SIZE   1088
- * ML_DSA_65_PK_SIZE    1952
+ *   transcript = SHA-256(domain || alice.x25519 || alice.kem_pk || alice.sig_pk
+ *                                || bob.x25519 || bob.sig_pk || kem_ct)
+ *   Bob signs   SIG_LABEL_RESPONDER || transcript
+ *   Alice signs SIG_LABEL_INITIATOR || transcript
+ *
+ *   keys = HKDF-SHA-256(ikm = x25519_ss || kem_ss, salt = transcript, info = HKDF_INFO, 64)
+ *   k_alice→bob = keys[0:32], k_bob→alice = keys[32:64]
+ *
+ *   safety code = SHA-256(SAS_LABEL || transcript), shown on both screens.
+ *   Signatures prove each side holds the key it advertised; only comparing the
+ *   safety code proves the advertised key belongs to the real peer (MITM check).
  *
  * Exceptions
  * ----------
@@ -26,21 +30,33 @@
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-export const PROTOCOL_VERSION      = '1';
-export const HKDF_INFO             = 'pqctunnel-session-v1';
-export const TRANSCRIPT_DOMAIN_SEP = 'pqctunnel-handshake-v1\x00';
+export const PROTOCOL_VERSION      = '2';
+export const HKDF_INFO             = 'pqctunnel-v2 directional keys';
+export const TRANSCRIPT_DOMAIN_SEP = 'pqctunnel-handshake-v2\x00';
+export const SIG_LABEL_RESPONDER   = 'pqctunnel-v2 responder signature\x00';
+export const SIG_LABEL_INITIATOR   = 'pqctunnel-v2 initiator signature\x00';
+export const SAS_LABEL             = 'pqctunnel-v2 safety code\x00';
+
+// Encrypted control message: Alice asks Bob to drop the session before a new
+// handshake. It rides inside AES-GCM, so only the real peer can send it.
+export const REKEY_SIGNAL          = '\u0000pqctunnel:rekey';
 
 export const X25519_PK_SIZE      = 32;
 export const ML_KEM_768_PK_SIZE  = 1184;
 export const ML_KEM_768_CT_SIZE  = 1088;
 export const ML_DSA_65_PK_SIZE   = 1952;
+export const ML_DSA_65_SIG_SIZE  = 3309;
+export const GCM_NONCE_SIZE      = 12;
+export const GCM_TAG_SIZE        = 16;
 
 export const VALID_ROLES = new Set(['alice', 'bob']);
 
-export const MSG_CLIENT_HELLO = 'client_hello';
-export const MSG_KEM_RESPONSE = 'kem_response';
-export const MSG_DATA         = 'data';
-export const MSG_REJECTION    = 'rejection';
+export const MSG_CLIENT_HELLO    = 'client_hello';
+export const MSG_KEM_RESPONSE    = 'kem_response';
+export const MSG_CLIENT_FINISHED = 'client_finished';
+export const MSG_DATA            = 'data';
+export const MSG_ALERT           = 'alert';
+export const MSG_REJECTION       = 'rejection';
 
 // ── Custom exceptions ──────────────────────────────────────────────────────
 
@@ -52,32 +68,64 @@ export class ReplayError extends Error {
   constructor(reason) { super(reason); this.name = 'ReplayError'; }
 }
 
-// ── Base64 helpers ─────────────────────────────────────────────────────────
+// ── Byte helpers ───────────────────────────────────────────────────────────
 
 export function bytesToB64(bytes) {
   // Works in both Node.js and browser
   if (typeof Buffer !== 'undefined') {
     return Buffer.from(bytes).toString('base64');
   }
-  return btoa(String.fromCharCode(...bytes));
+  // Chunked: spreading a large array into fromCharCode overflows the call stack
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
 }
 
 export function b64ToBytes(b64) {
-  if (typeof Buffer !== 'undefined') {
-    return new Uint8Array(Buffer.from(b64, 'base64'));
+  if (typeof b64 !== 'string') return new Uint8Array(0);
+  try {
+    if (typeof Buffer !== 'undefined') {
+      return new Uint8Array(Buffer.from(b64, 'base64'));
+    }
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return new Uint8Array(0);
   }
-  return new Uint8Array(atob(b64).split('').map(c => c.charCodeAt(0)));
+}
+
+export function concatBytes(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let offset = 0;
+  for (const p of parts) { out.set(p, offset); offset += p.length; }
+  return out;
+}
+
+const utf8 = (s) => new TextEncoder().encode(s);
+
+export async function sha256(bytes) {
+  return new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes));
+}
+
+/** Hex-encode a Uint8Array for display. */
+export function toHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Short display fingerprint of a key: first 8 bytes of its SHA-256. */
+export async function fingerprint(bytes) {
+  return toHex((await sha256(bytes)).slice(0, 8)).match(/.{4}/g).join(':');
 }
 
 // ── Transcript hash ────────────────────────────────────────────────────────
 
 /**
- * Compute the handshake transcript hash.
- * Exact port of protocol.py::compute_transcript().
- *
- * Both parties compute this independently and must arrive at identical bytes.
- * The ML-DSA-65 signature is over this 32-byte hash.
- *
+ * Compute the handshake transcript hash. All fields are fixed-length (sizes are
+ * validated before this is called), so plain concatenation is unambiguous.
  * @returns {Promise<Uint8Array>} 32-byte SHA-256 of transcript material
  */
 export async function computeTranscript(
@@ -88,72 +136,105 @@ export async function computeTranscript(
   responderSigPk,
   kemCt
 ) {
-  const enc = new TextEncoder();
-  const domainSep = enc.encode(TRANSCRIPT_DOMAIN_SEP);
-
-  // Concatenate all material in the same order as the Python reference
-  const total = domainSep.length +
-    initiatorX25519Pk.length + initiatorKemPk.length + initiatorSigPk.length +
-    responderX25519Pk.length + responderSigPk.length +
-    kemCt.length;
-
-  const material = new Uint8Array(total);
-  let offset = 0;
-  for (const part of [domainSep, initiatorX25519Pk, initiatorKemPk, initiatorSigPk,
-                       responderX25519Pk, responderSigPk, kemCt]) {
-    material.set(part, offset);
-    offset += part.length;
-  }
-
-  const hash = await globalThis.crypto.subtle.digest('SHA-256', material);
-  return new Uint8Array(hash);
+  return sha256(concatBytes(
+    utf8(TRANSCRIPT_DOMAIN_SEP),
+    initiatorX25519Pk, initiatorKemPk, initiatorSigPk,
+    responderX25519Pk, responderSigPk,
+    kemCt,
+  ));
 }
 
-// ── validate_client_hello ──────────────────────────────────────────────────
+/** Bytes that get signed: role label || transcript (stops cross-role reuse). */
+export function signedPayload(label, transcript) {
+  return concatBytes(utf8(label), transcript);
+}
+
+// ── Safety code (short authentication string) ──────────────────────────────
+
+const SAS_EMOJI = [
+  '🐶','🐱','🦁','🐴','🦄','🐷','🐘','🐰','🐼','🐓','🐧','🐢','🐟','🐙','🦋','🌷',
+  '🌳','🌵','🍄','🌏','🌙','☁️','🔥','🍌','🍎','🍓','🌽','🍕','🎂','❤️','😀','🤖',
+  '🎩','👓','🔧','🎅','👍','☂️','⌛','⏰','🎁','💡','📕','✏️','📎','✂️','🔒','🔑',
+  '🔨','☎️','🏁','🚂','🚲','✈️','🚀','🏆','⚽','🎸','🎺','🔔','⚓','🎧','📁','📌',
+];
 
 /**
- * Structural and identity pre-checks on a received ClientHello payload dict.
- * Port of protocol.py::validate_client_hello().
- *
- * @param {object} hello           Parsed ClientHello payload
- * @param {object|null} [original] The original ClientHello payload for MITM check
+ * Derive the human-comparable safety code from the transcript.
+ * If Alice and Bob see the same code, nobody substituted keys in between.
+ * @returns {Promise<{ emoji: string[], digits: string, hex: string }>}
+ */
+export async function deriveSafetyCode(transcript) {
+  const h = await sha256(concatBytes(utf8(SAS_LABEL), transcript));
+  const emoji = Array.from(h.slice(0, 6), b => SAS_EMOJI[b & 63]);
+  // 4 groups of 5 digits from bytes 6..21
+  const groups = [];
+  for (let g = 0; g < 4; g++) {
+    const v = ((h[6 + g * 4] << 24) >>> 0) + (h[7 + g * 4] << 16) + (h[8 + g * 4] << 8) + h[9 + g * 4];
+    groups.push(String(v % 100000).padStart(5, '0'));
+  }
+  return { emoji, digits: groups.join(' '), hex: toHex(h) };
+}
+
+// ── Validation ─────────────────────────────────────────────────────────────
+
+/**
+ * Structural pre-checks on a received ClientHello payload.
  * @throws {ProtocolError} With specific rejection reason on failure
  */
-export function validateClientHello(hello, original = null) {
-  const x25519Pk = b64ToBytes(hello.x25519_pk || '');
-  const kemPk    = b64ToBytes(hello.kem_pk    || '');
-  const sigPk    = b64ToBytes(hello.sig_pk    || '');
-
-  // Classical field check
-  if (x25519Pk.length !== X25519_PK_SIZE) {
+export function validateClientHello(hello) {
+  if (!hello || typeof hello !== 'object') {
+    throw new ProtocolError('malformed ClientHello: not an object');
+  }
+  if (b64ToBytes(hello.x25519_pk).length !== X25519_PK_SIZE) {
     throw new ProtocolError('malformed ClientHello: classical fields missing');
   }
   // PQC field checks (downgrade detection)
-  if (kemPk.length !== ML_KEM_768_PK_SIZE) {
+  if (b64ToBytes(hello.kem_pk).length !== ML_KEM_768_PK_SIZE ||
+      b64ToBytes(hello.sig_pk).length !== ML_DSA_65_PK_SIZE) {
     throw new ProtocolError('malformed ClientHello: PQC fields missing');
   }
-  if (sigPk.length !== ML_DSA_65_PK_SIZE) {
-    throw new ProtocolError('malformed ClientHello: PQC fields missing');
-  }
-  // Version / role checks
   if (hello.version !== PROTOCOL_VERSION) {
     throw new ProtocolError(`unsupported protocol version: ${JSON.stringify(hello.version)}`);
   }
-  if (!VALID_ROLES.has(hello.role)) {
+  if (hello.role !== 'alice') {
     throw new ProtocolError(`invalid role: ${JSON.stringify(hello.role)}`);
   }
+}
 
-  // MITM key substitution check (only when original is provided)
-  if (original !== null) {
-    const keysMatch = (
-      hello.x25519_pk === original.x25519_pk &&
-      hello.kem_pk    === original.kem_pk    &&
-      hello.sig_pk    === original.sig_pk
-    );
-    if (!keysMatch) {
-      throw new ProtocolError('public key does not match session identity');
-    }
+/** Structural pre-checks on a received KemResponse payload. */
+export function validateKemResponse(resp) {
+  if (!resp || typeof resp !== 'object') {
+    throw new ProtocolError('malformed KemResponse: not an object');
   }
+  if (b64ToBytes(resp.x25519_pk).length !== X25519_PK_SIZE) {
+    throw new ProtocolError('malformed KemResponse: classical fields missing');
+  }
+  if (b64ToBytes(resp.kem_ct).length !== ML_KEM_768_CT_SIZE ||
+      b64ToBytes(resp.sig_pk).length !== ML_DSA_65_PK_SIZE) {
+    throw new ProtocolError('malformed KemResponse: PQC fields missing');
+  }
+  if (b64ToBytes(resp.signature).length !== ML_DSA_65_SIG_SIZE) {
+    throw new ProtocolError('malformed KemResponse: signature missing');
+  }
+}
+
+/** Structural pre-checks on a received ClientFinished payload. */
+export function validateClientFinished(fin) {
+  if (!fin || b64ToBytes(fin.signature).length !== ML_DSA_65_SIG_SIZE) {
+    throw new ProtocolError('malformed ClientFinished: signature missing');
+  }
+}
+
+/**
+ * Sequence numbers must be JSON numbers that are non-negative safe integers.
+ * Anything else ("x", 0.5, null) would otherwise alias seq 0 in the AAD
+ * encoding and slip past the replay set.
+ */
+export function validateSeq(seq) {
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0) {
+    throw new ProtocolError(`invalid sequence number: ${JSON.stringify(seq)}`);
+  }
+  return seq;
 }
 
 // ── Message builders ───────────────────────────────────────────────────────
@@ -179,6 +260,11 @@ export function buildKemResponse(kemCt, x25519Pk, sigPk, signature) {
   };
 }
 
+/** Build a ClientFinished payload. */
+export function buildClientFinished(signature) {
+  return { signature: bytesToB64(signature) };
+}
+
 /** Build a DataMessage payload, binding seq into AAD. */
 export function buildDataMessage(seq, nonce, ciphertext, tag) {
   return {
@@ -189,46 +275,31 @@ export function buildDataMessage(seq, nonce, ciphertext, tag) {
   };
 }
 
-/** Parse a DataMessage payload back to typed fields. */
+/**
+ * Parse a DataMessage payload back to typed fields.
+ * @throws {ProtocolError} on a bad seq, nonce or tag
+ */
 export function parseDataMessage(payload) {
-  return {
-    seq:        Number(payload.seq),
-    nonce:      b64ToBytes(payload.nonce),
-    ciphertext: b64ToBytes(payload.ciphertext),
-    tag:        b64ToBytes(payload.tag),
-  };
+  if (!payload || typeof payload !== 'object') {
+    throw new ProtocolError('malformed DataMessage: not an object');
+  }
+  const seq   = validateSeq(payload.seq);
+  const nonce = b64ToBytes(payload.nonce);
+  const tag   = b64ToBytes(payload.tag);
+  if (nonce.length !== GCM_NONCE_SIZE) throw new ProtocolError('malformed DataMessage: bad nonce');
+  if (tag.length !== GCM_TAG_SIZE)     throw new ProtocolError('malformed DataMessage: bad tag');
+  return { seq, nonce, ciphertext: b64ToBytes(payload.ciphertext), tag };
 }
 
-/** Encode sequence number as 8-byte big-endian AAD (matches Python). */
+/** Encode sequence number as 8-byte big-endian AAD. */
 export function seqAad(seq) {
+  validateSeq(seq);
   const buf = new Uint8Array(8);
-  // seq is a safe integer; write as big-endian 64-bit
-  let n = seq;
-  for (let i = 7; i >= 0; i--) {
-    buf[i] = n & 0xff;
-    n = Math.floor(n / 256);
-  }
+  new DataView(buf.buffer).setBigUint64(0, BigInt(seq));
   return buf;
 }
 
 /** Wrap a message object in the standard { type, payload } envelope. */
 export function makeEnvelope(type, payload) {
   return { type, payload };
-}
-
-/** Parse an envelope; throw ProtocolError if malformed. */
-export function parseEnvelope(envelope) {
-  const validTypes = new Set([MSG_CLIENT_HELLO, MSG_KEM_RESPONSE, MSG_DATA, MSG_REJECTION]);
-  if (!envelope || typeof envelope.type !== 'string') {
-    throw new ProtocolError('malformed envelope: missing type');
-  }
-  if (!validTypes.has(envelope.type)) {
-    throw new ProtocolError(`unknown message type: ${JSON.stringify(envelope.type)}`);
-  }
-  return { type: envelope.type, payload: envelope.payload };
-}
-
-/** Hex-encode a Uint8Array for display. */
-export function toHex(bytes) {
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }

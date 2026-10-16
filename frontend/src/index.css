@@ -186,3 +186,31 @@ html, body, #root {
   50%       { opacity: 0.4; }
 }
 .animate-pulse-subtle { animation: pulse-subtle 2s cubic-bezier(0.4,0,0.6,1) infinite; }
+
+/* ── Crypto trace step reveal + secret blur ─────────────────── */
+@keyframes trace-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+.trace-step { animation: trace-in 0.35s ease-out both; }
+.secret-blur { filter: blur(5px); }
+
+/* Packet flying across the tunnel when a frame is sent or received */
+@keyframes packet-fly {
+  0%   { left: 0%;   opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 1; }
+  100% { left: calc(100% - 10px); opacity: 0; }
+}
+@keyframes packet-fly-rev {
+  0%   { left: calc(100% - 10px); opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 1; }
+  100% { left: 0%; opacity: 0; }
+}
+.packet-fly     { animation: packet-fly 0.9s ease-in-out both; }
+.packet-fly-rev { animation: packet-fly-rev 0.9s ease-in-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .trace-step, .packet-fly, .packet-fly-rev { animation: none; }
+}
