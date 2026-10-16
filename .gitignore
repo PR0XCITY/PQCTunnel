@@ -44,3 +44,6 @@ Thumbs.db
 
 # Native dependencies (liboqs is a build-time dep, not tracked)
 liboqs/
+
+# Local editor/agent config
+.claude/

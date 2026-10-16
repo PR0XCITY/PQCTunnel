@@ -225,7 +225,8 @@ export function usePeerSession(roomCode, role) {
     const { type, payload } = msg ?? {};
     switch (type) {
       case 'joined':
-        setStatusMsg(`Joined room ${payload.room} as ${role.toUpperCase()}`);
+        // A (re)connection starts from scratch: the relay reset this room's state
+        resetSession(`Joined room ${payload.room} as ${role.toUpperCase()}`);
         setEveOnline(payload.peers?.includes('eve') ?? false);
         if (payload.peers?.includes(peer)) {
           setPeerOnline(true);
@@ -273,7 +274,7 @@ export function usePeerSession(roomCode, role) {
       .catch(e => console.error('[session] handler error', e));
   }, []);
 
-  const { status: wsStatus, send } = useWebSocket(roomCode, role, { onMessage });
+  const { status: wsStatus, error: wsError, relayUrl, send } = useWebSocket(roomCode, role, { onMessage });
   useEffect(() => { sendRef.current = send; }, [send]);
 
   // ── Sending ──────────────────────────────────────────────────────────────
@@ -313,7 +314,7 @@ export function usePeerSession(roomCode, role) {
   }, [isInitiator, resetSession, startHandshake, transmit]);
 
   return {
-    peer, isInitiator, wsStatus,
+    peer, isInitiator, wsStatus, wsError, relayUrl,
     phase, statusMsg, peerOnline, eveOnline,
     messages, wireLog, handshake, verification,
     sendMessage, confirmSafetyCode, restartHandshake,

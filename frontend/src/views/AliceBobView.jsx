@@ -170,6 +170,15 @@ export default function AliceBobView({ roomCode, role }) {
             <TunnelStrip role={role} peer={peer} peerOnline={s.peerOnline} eveOnline={s.eveOnline}
               phase={phase} lastPacket={lastPacket} />
 
+            {s.wsStatus !== 'connected' && (
+              <div className="rounded-xl px-md py-2 flex items-center gap-2 font-mono-soc text-code-md bg-error/10 text-error">
+                <span className="material-symbols-outlined text-[18px]">cloud_off</span>
+                <span className="truncate">
+                  {s.wsError ?? (s.wsStatus === 'connecting' ? 'Connecting to relay' : 'Relay connection lost — retrying')} ({s.relayUrl})
+                </span>
+              </div>
+            )}
+
             {/* Status banner */}
             <div className={`rounded-xl px-md py-2 flex items-center gap-2 font-mono-soc text-code-md ${
               isSecure ? 'bg-secondary/10 text-secondary' : phase === 'error' || phase === 'aborted' ? 'bg-error/10 text-error' : 'bg-surface-container-low text-on-surface-variant'
